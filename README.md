@@ -401,10 +401,6 @@ vs. Traditional On-Premise:
 
 ---
 
-## 🎉 **THE FUTURE OF MEDICAL AI IS HERE**
-
-This isn't just another medical imaging platform—**this is the enterprise-grade solution that Fortune 500 healthcare organizations choose when failure is not an option.**
-
 ### **🚀 Ready to Transform Healthcare?**
 
 **Deploy in 30 minutes. Scale to millions of images. Save lives with AI.**
@@ -417,5 +413,3 @@ This isn't just another medical imaging platform—**this is the enterprise-grad
 **Your patients deserve the best medical AI. Your organization deserves enterprise excellence.**
 
 ---
-
-*Built with ❤️ by the Medical AI Platform Team | Enterprise Grade | Production Ready | FAANG Standards*
