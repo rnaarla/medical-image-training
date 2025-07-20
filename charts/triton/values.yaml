@@ -1,0 +1,27 @@
+
+replicaCount: 1
+
+image:
+  repository: nvcr.io/nvidia/tritonserver
+  tag: 23.06-py3
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    nvidia.com/gpu: 1
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+service:
+  type: ClusterIP
+  port: 8000
+
+volumeMounts:
+  - name: model-volume
+    mountPath: /models
+volumes:
+  - name: model-volume
+    hostPath:
+      path: /mnt/models
+      type: Directory

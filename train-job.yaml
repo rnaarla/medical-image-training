@@ -1,0 +1,345 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: medical-image-training
+  namespace: default
+  labels:
+    app: medical-training
+    type: distributed-training
+    framework: pytorch
+spec:
+  # Job will be cleaned up automatically after 1 day
+  ttlSecondsAfterFinished: 86400
+  # Retry failed jobs up to 3 times
+  backoffLimit: 3
+  
+  template:
+    metadata:
+      labels:
+        app: medical-training
+        type: distributed-training
+      annotations:
+        # Enable higher shared memory for distributed training
+        pod.kubernetes.io/shared-memory-size: "2Gi"
+    spec:
+      # Use training service account with S3 access
+      serviceAccountName: training-service-account
+      
+      # Schedule on GPU nodes only
+      nodeSelector:
+        node-type: gpu
+      
+      # Tolerate GPU node taints
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      
+      # Restart policy for batch jobs
+      restartPolicy: Never
+      
+      # Init container to download data and models
+      initContainers:
+      - name: data-downloader
+        image: amazon/aws-cli:2.13.0
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Downloading training data and model checkpoints..."
+          
+          # Create directories
+          mkdir -p /shared/data/{train,val,test}
+          mkdir -p /shared/models
+          mkdir -p /shared/checkpoints
+          
+          # Download sample dataset (replace with your actual data source)
+          # aws s3 sync s3://your-training-data-bucket/train /shared/data/train
+          # aws s3 sync s3://your-training-data-bucket/val /shared/data/val
+          
+          # For demo, create placeholder structure
+          echo "Creating demo data structure..."
+          for split in train val test; do
+            for class in class_0 class_1 class_2 class_3 class_4 class_5 class_6 class_7 class_8 class_9; do
+              mkdir -p /shared/data/$split/$class
+              # Create placeholder files
+              touch /shared/data/$split/$class/placeholder.txt
+            done
+          done
+          
+          echo "Data download completed"
+        
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /shared
+        
+        env:
+        - name: AWS_DEFAULT_REGION
+          value: "us-west-2"
+        
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      
+      containers:
+      # Main training container
+      - name: pytorch-trainer
+        image: medical-training:latest  # This should be built from your Dockerfile.train
+        imagePullPolicy: Always
+        
+        command:
+        - /bin/bash
+        - -c
+        - |
+          echo "Starting distributed PyTorch training..."
+          
+          # Set distributed training environment variables
+          export MASTER_ADDR=${MASTER_ADDR:-"localhost"}
+          export MASTER_PORT=${MASTER_PORT:-"12355"}
+          export WORLD_SIZE=${WORLD_SIZE:-"1"}
+          export RANK=${RANK:-"0"}
+          export LOCAL_RANK=${LOCAL_RANK:-"0"}
+          
+          # GPU device setup
+          export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0"}
+          
+          # Weights & Biases setup (if using)
+          export WANDB_MODE=${WANDB_MODE:-"online"}
+          export WANDB_PROJECT="medical-image-training"
+          export WANDB_ENTITY=${WANDB_ENTITY:-""}
+          
+          echo "Environment setup complete:"
+          echo "  MASTER_ADDR: $MASTER_ADDR"
+          echo "  WORLD_SIZE: $WORLD_SIZE"
+          echo "  RANK: $RANK"
+          echo "  CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+          
+          # Verify GPU access
+          python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}')"
+          
+          # Start training with error handling
+          python train.py \
+            --data-path /shared/data \
+            --batch-size 64 \
+            --epochs 100 \
+            --lr 1e-3 \
+            --save-dir /shared/checkpoints \
+            2>&1 | tee /shared/logs/training.log
+          
+          echo "Training completed, uploading results..."
+          
+          # Upload final model to S3
+          if [ -f "/shared/checkpoints/best_model.pt" ]; then
+            echo "Uploading best model to S3..."
+            aws s3 cp /shared/checkpoints/best_model.pt s3://${S3_BUCKET}/models/$(date +%Y%m%d_%H%M%S)/best_model.pt
+            
+            # Export to ONNX
+            python onnx_export.py \
+              --checkpoint-path /shared/checkpoints/best_model.pt \
+              --onnx-path /shared/models/model.onnx
+            
+            # Upload ONNX model
+            aws s3 cp /shared/models/model.onnx s3://${S3_BUCKET}/models/$(date +%Y%m%d_%H%M%S)/model.onnx
+            aws s3 cp model_repo/resnet/config.pbtxt s3://${S3_BUCKET}/models/$(date +%Y%m%d_%H%M%S)/config.pbtxt
+          fi
+          
+          echo "Job completed successfully"
+        
+        env:
+        # Distributed training configuration
+        - name: WORLD_SIZE
+          value: "1"  # Single GPU for this example, increase for multi-GPU
+        - name: RANK
+          value: "0"
+        - name: LOCAL_RANK
+          value: "0"
+        - name: MASTER_ADDR
+          value: "localhost"
+        - name: MASTER_PORT
+          value: "12355"
+        
+        # NCCL configuration for distributed training
+        - name: NCCL_DEBUG
+          value: "INFO"
+        - name: NCCL_SOCKET_IFNAME
+          value: "^docker0,lo"
+        
+        # S3 bucket for model uploads
+        - name: S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: training-config
+              key: s3-bucket
+        
+        # Weights & Biases configuration
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret
+              key: api-key
+              optional: true
+        - name: WANDB_MODE
+          value: "online"
+        - name: WANDB_PROJECT
+          value: "medical-image-training"
+        
+        # CUDA and PyTorch settings
+        - name: CUDA_LAUNCH_BLOCKING
+          value: "1"
+        - name: TORCH_CUDA_ARCH_LIST
+          value: "8.0"
+        
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            cpu: 4
+            memory: 16Gi
+          limits:
+            nvidia.com/gpu: 1
+            cpu: 8
+            memory: 32Gi
+        
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /shared
+        - name: dev-shm
+          mountPath: /dev/shm
+        
+        # Health checks
+        livenessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - "ps aux | grep python | grep -v grep"
+          initialDelaySeconds: 300
+          periodSeconds: 60
+          timeoutSeconds: 30
+          failureThreshold: 3
+        
+        readinessProbe:
+          exec:
+            command:
+            - /bin/bash
+            - -c
+            - "ls -la /shared/checkpoints/"
+          initialDelaySeconds: 60
+          periodSeconds: 30
+      
+      # Sidecar container for monitoring and logging
+      - name: metrics-exporter
+        image: prom/node-exporter:v1.6.0
+        args:
+        - "--path.procfs=/host/proc"
+        - "--path.sysfs=/host/sys"
+        - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+        - "--web.listen-address=0.0.0.0:9100"
+        
+        ports:
+        - name: metrics
+          containerPort: 9100
+          protocol: TCP
+        
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      
+      volumes:
+      # Shared storage for models, data, and checkpoints
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+      
+      # Large shared memory for DataLoader workers
+      - name: dev-shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      
+      # Host volumes for metrics
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+
+---
+# ConfigMap for training configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: training-config
+  namespace: default
+data:
+  s3-bucket: "medical-training-models"  # Replace with actual bucket name
+  epochs: "100"
+  batch-size: "64"
+  learning-rate: "0.001"
+  image-size: "224"
+  num-classes: "10"
+
+---
+# Secret for Weights & Biases API key (create separately)
+# kubectl create secret generic wandb-secret --from-literal=api-key=your_wandb_api_key
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wandb-secret
+  namespace: default
+type: Opaque
+stringData:
+  api-key: ""  # Set this to your actual W&B API key
+
+---
+# Service for metrics exposure
+apiVersion: v1
+kind: Service
+metadata:
+  name: training-metrics
+  namespace: default
+  labels:
+    app: medical-training
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9100
+    targetPort: 9100
+    protocol: TCP
+  selector:
+    app: medical-training
+
+---
+# ServiceMonitor for Prometheus scraping (if using Prometheus operator)
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: training-metrics
+  namespace: default
+  labels:
+    app: medical-training
+spec:
+  selector:
+    matchLabels:
+      app: medical-training
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics

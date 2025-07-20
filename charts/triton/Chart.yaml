@@ -1,0 +1,7 @@
+
+apiVersion: v2
+name: triton
+description: A Helm chart to deploy NVIDIA Triton Inference Server
+type: application
+version: 0.1.0
+appVersion: "23.06"

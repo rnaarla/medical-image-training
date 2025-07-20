@@ -1,0 +1,324 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: triton-ingress
+  namespace: default
+  annotations:
+    # Use NGINX Ingress Controller
+    kubernetes.io/ingress.class: nginx
+    
+    # SSL/TLS Configuration
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    
+    # Increase proxy timeouts for long-running inference requests
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    
+    # Enable large file uploads for model inputs
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    
+    # CORS configuration for web clients
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://*.yourdomain.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "DNT,User-Agent,X-Requested-With,If-Modified-Since,Cache-Control,Content-Type,Range,Authorization"
+    
+    # Rate limiting
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+    
+    # Security headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Frame-Options SAMEORIGIN;
+      add_header X-Content-Type-Options nosniff;
+      add_header X-XSS-Protection "1; mode=block";
+      add_header Strict-Transport-Security "max-age=31536000; includeSubDomains";
+      add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';";
+
+spec:
+  tls:
+  - hosts:
+    - triton.yourdomain.com  # Replace with your actual domain
+    secretName: triton-tls-secret
+  
+  rules:
+  - host: triton.yourdomain.com  # Replace with your actual domain
+    http:
+      paths:
+      # Triton HTTP inference endpoint
+      - path: /v2
+        pathType: Prefix
+        backend:
+          service:
+            name: triton
+            port:
+              number: 8000
+      
+      # Health check endpoints
+      - path: /v2/health
+        pathType: Prefix
+        backend:
+          service:
+            name: triton
+            port:
+              number: 8000
+      
+      # Model repository endpoints
+      - path: /v2/repository
+        pathType: Prefix
+        backend:
+          service:
+            name: triton
+            port:
+              number: 8000
+      
+      # Metrics endpoint (protected)
+      - path: /metrics
+        pathType: Prefix
+        backend:
+          service:
+            name: triton
+            port:
+              number: 8002
+
+---
+# ClusterIssuer for Let's Encrypt certificates
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    # Replace with your email
+    email: admin@yourdomain.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod-private-key
+    
+    # HTTP01 solver for domain validation
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+
+---
+# Monitoring Ingress for Grafana and Prometheus
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: monitoring-ingress
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    
+    # Basic auth for security (create secret separately)
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: monitoring-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Monitoring Dashboard"
+
+spec:
+  tls:
+  - hosts:
+    - grafana.yourdomain.com    # Replace with your actual domain
+    - prometheus.yourdomain.com # Replace with your actual domain
+    secretName: monitoring-tls-secret
+  
+  rules:
+  # Grafana Dashboard
+  - host: grafana.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kube-prometheus-stack-grafana
+            port:
+              number: 80
+  
+  # Prometheus UI
+  - host: prometheus.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kube-prometheus-stack-prometheus
+            port:
+              number: 9090
+
+---
+# Network Policy for Triton Server (Security)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: triton-network-policy
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: triton
+  
+  policyTypes:
+  - Ingress
+  - Egress
+  
+  ingress:
+  # Allow traffic from NGINX ingress controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8001
+    - protocol: TCP
+      port: 8002
+  
+  # Allow traffic from monitoring namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8002  # Metrics port
+  
+  egress:
+  # Allow DNS
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+  
+  # Allow HTTPS for model downloads
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  
+  # Allow S3 access
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Service for Triton metrics (separate from main service)
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-metrics
+  namespace: default
+  labels:
+    app.kubernetes.io/name: triton
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 8002
+    targetPort: 8002
+    protocol: TCP
+  selector:
+    app.kubernetes.io/name: triton
+
+---
+# ServiceMonitor for Prometheus to scrape Triton metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: triton-metrics
+  namespace: default
+  labels:
+    app.kubernetes.io/name: triton
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: triton
+      app.kubernetes.io/component: metrics
+  
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+    
+  namespaceSelector:
+    matchNames:
+    - default
+
+---
+# HorizontalPodAutoscaler for Triton (auto-scaling based on load)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: triton-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: triton
+  
+  minReplicas: 1
+  maxReplicas: 10
+  
+  metrics:
+  # Scale based on CPU utilization
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  
+  # Scale based on memory utilization  
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  
+  # Scale based on GPU utilization (requires custom metrics)
+  - type: Pods
+    pods:
+      metric:
+        name: nvidia_gpu_utilization
+      target:
+        type: AverageValue
+        averageValue: "70"
+  
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 25
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+
+---
+# PodDisruptionBudget to ensure availability during updates
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: triton-pdb
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: triton

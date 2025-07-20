@@ -1,0 +1,19 @@
+
+name: "resnet"
+platform: "onnxruntime_onnx"
+max_batch_size: 128
+input [
+  {
+    name: "input__0"
+    data_type: TYPE_FP32
+    format: FORMAT_NCHW
+    dims: [3, 32, 32]
+  }
+]
+output [
+  {
+    name: "output__0"
+    data_type: TYPE_FP32
+    dims: [10]
+  }
+]
