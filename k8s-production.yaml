@@ -1,0 +1,280 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: medical-training-config
+  namespace: medical-training
+data:
+  environment: "production"
+  log_level: "INFO"
+  api_port: "8000"
+  workers: "4"
+  batch_size: "32"
+  max_image_size: "4096"
+  supported_formats: "DICOM,PNG,JPEG,TIFF"
+  prometheus_port: "9090"
+  metrics_enabled: "true"
+  health_check_interval: "30"
+  audit_logging: "true"
+  phi_protection: "true"
+  gdpr_compliance: "true"
+  
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: medical-training-secrets
+  namespace: medical-training
+type: Opaque
+stringData:
+  jwt_secret_key: "your-jwt-secret-key-change-in-production"
+  database_url: "postgresql://username:password@rds-endpoint:5432/medical_ai"
+  api_key: "your-api-key-change-in-production"
+  
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: medical-training-api
+  namespace: medical-training
+  labels:
+    app: medical-training-api
+    version: v2.0.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: medical-training-api
+  template:
+    metadata:
+      labels:
+        app: medical-training-api
+        version: v2.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+      - name: medical-training-api
+        image: ${ECR_REPOSITORY_URL}:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        env:
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: medical-training-config
+              key: environment
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: medical-training-config
+              key: log_level
+        - name: API_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: medical-training-config
+              key: api_port
+        - name: WORKERS
+          valueFrom:
+            configMapKeyRef:
+              name: medical-training-config
+              key: workers
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: medical-training-secrets
+              key: jwt_secret_key
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: medical-training-secrets
+              key: database_url
+        - name: AWS_REGION
+          value: "${AWS_REGION}"
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8000
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+        - name: temp-data
+          mountPath: /tmp/data
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+      - name: temp-data
+        emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - medical-training-api
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: medical-training-api-service
+  namespace: medical-training
+  labels:
+    app: medical-training-api
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: metrics
+  selector:
+    app: medical-training-api
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-storage-pvc
+  namespace: medical-training
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: efs-sc
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: medical-training-network-policy
+  namespace: medical-training
+spec:
+  podSelector:
+    matchLabels:
+      app: medical-training-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 9090
+  egress:
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS
+    - protocol: TCP
+      port: 5432  # PostgreSQL
+    - protocol: UDP
+      port: 53   # DNS
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: medical-training-api-hpa
+  namespace: medical-training
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: medical-training-api
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
