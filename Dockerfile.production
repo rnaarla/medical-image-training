@@ -1,0 +1,96 @@
+# Production-Ready Dockerfile for Medical Image Training Platform
+# Multi-stage build for optimized production image
+
+# Stage 1: Build stage
+FROM nvcr.io/nvidia/pytorch:23.06-py3 as builder
+
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements_production.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements_production.txt
+
+# Copy source code
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY *.py ./
+
+# Compile any custom extensions if needed
+RUN if [ -f setup_custom_kernel.py ]; then \
+        TORCH_CUDA_ARCH_LIST="8.0" python setup_custom_kernel.py build_ext --inplace; \
+    fi
+
+# Stage 2: Production stage
+FROM nvcr.io/nvidia/pytorch:23.06-py3
+
+# Set production environment
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV ENVIRONMENT=production
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Create non-root user for security
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create necessary directories
+RUN mkdir -p /app /models /data /tmp/data && \
+    chown -R appuser:appuser /app /models /data /tmp/data
+
+WORKDIR /app
+
+# Copy from builder stage
+COPY --from=builder --chown=appuser:appuser /app .
+
+# Copy production configuration
+COPY --chown=appuser:appuser .env.production .env
+COPY --chown=appuser:appuser production_api.py .
+
+# Install production requirements
+COPY --chown=appuser:appuser requirements_production.txt .
+RUN pip install --no-cache-dir -r requirements_production.txt
+
+# Security: Remove package caches and temporary files
+RUN pip cache purge && \
+    rm -rf ~/.cache && \
+    rm -rf /tmp/* && \
+    rm -rf /var/tmp/*
+
+# Set proper permissions
+RUN chmod +x scripts/*.sh && \
+    chmod 644 *.py
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Switch to non-root user
+USER appuser
+
+# Expose ports
+EXPOSE 8000 9090
+
+# Set resource limits (can be overridden in Kubernetes)
+ENV WORKERS=4
+ENV MAX_MEMORY=4G
+
+# Production command
+CMD ["python", "production_api.py"]
+
+# Labels for production deployment
+LABEL maintainer="Medical AI Platform Team"
+LABEL version="2.0.0"
+LABEL description="Production-ready medical image training platform"
+LABEL org.opencontainers.image.source="https://github.com/rnaarla/medical-image-training"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.vendor="Medical AI Platform"
